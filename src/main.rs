@@ -15,10 +15,12 @@ use config::Config;
 use regex::Regex;
 use ctrlc;
 use std::io::Write;
+use std::io::{BufWriter, Seek, SeekFrom};
 
 const SAVE_BATCH_SIZE: usize = 10000;
 const MIN_BATCH_SIZE: u32 = 50;
 const MAX_BATCH_SIZE: u32 = 1000;
+const INDEX_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug)]
 struct GitlabError(String);
@@ -403,50 +405,104 @@ async fn fetch_issues(
     Ok((all_issues, state))
 }
 
-fn export_issues_to_json(data_dir: &str, issues: &[Value]) -> Result<(), Box<dyn Error>> {
-    let json_path = Path::new(data_dir).join("issues.json");
-    let existing_issues = if json_path.exists() {
-        let content = fs::read_to_string(&json_path)?;
-        serde_json::from_str::<Vec<Value>>(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+struct IssueStore {
+    data_dir: String,
+    issue_file: BufWriter<fs::File>,
+    index: HashSet<i64>,
+}
 
-    // Create a HashSet of existing issue IDs for quick lookup
-    let existing_ids: HashSet<i64> = existing_issues
-        .iter()
-        .filter_map(|issue| issue["id"].as_i64())
-        .collect();
+impl IssueStore {
+    fn new(data_dir: &str) -> Result<Self, Box<dyn Error>> {
+        let json_path = Path::new(data_dir).join("issues.json");
+        let index_path = Path::new(data_dir).join("issues.index");
+        
+        // Load or create index
+        let index = if index_path.exists() {
+            let content = fs::read_to_string(&index_path)?;
+            content.lines()
+                .filter_map(|line| line.parse::<i64>().ok())
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
-    // Only add new issues that aren't already present
-    let mut all_issues = existing_issues;
-    for issue in issues {
-        if let Some(id) = issue["id"].as_i64() {
-            if !existing_ids.contains(&id) {
-                all_issues.push(issue.clone());
-            }
+        // Open file in append mode
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&json_path)?;
+
+        // Create if doesn't exist and ensure valid JSON
+        if file.metadata()?.len() == 0 {
+            let mut writer = BufWriter::new(file);
+            writer.write_all(b"[\n")?;
+            writer.flush()?;
+            Ok(Self {
+                data_dir: data_dir.to_string(),
+                issue_file: writer,
+                index,
+            })
+        } else {
+            Ok(Self {
+                data_dir: data_dir.to_string(),
+                issue_file: BufWriter::new(file),
+                index,
+            })
         }
     }
 
-    // Sort issues by created_at date descending
-    all_issues.sort_by(|a, b| {
-        let a_date = a["created_at"].as_str().unwrap_or_default();
-        let b_date = b["created_at"].as_str().unwrap_or_default();
-        b_date.cmp(a_date)
-    });
+    fn add_issues(&mut self, issues: &[Value]) -> Result<usize, Box<dyn Error>> {
+        let mut added = 0;
 
-    // Write the combined issues back to file
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(json_path)?;
+        for issue in issues {
+            if let Some(id) = issue["id"].as_i64() {
+                if !self.index.contains(&id) {
+                    // Add comma if not first entry
+                    if !self.index.is_empty() {
+                        self.issue_file.write_all(b",\n")?;
+                    }
+                    
+                    let json = serde_json::to_string(issue)?;
+                    self.issue_file.write_all(json.as_bytes())?;
+                    self.index.insert(id);
+                    added += 1;
 
-    let json_str = serde_json::to_string_pretty(&all_issues)?;
-    file.write_all(json_str.as_bytes())?;
-    file.flush()?;
+                    // Periodically flush to disk
+                    if added % INDEX_BATCH_SIZE == 0 {
+                        self.issue_file.flush()?;
+                        self.save_index()?;
+                    }
+                }
+            }
+        }
 
-    println!("Saved {} total issues to JSON", all_issues.len());
+        if added > 0 {
+            self.issue_file.flush()?;
+            self.save_index()?;
+        }
+
+        println!("Added {} new issues", added);
+        Ok(added)
+    }
+
+    fn save_index(&self) -> Result<(), Box<dyn Error>> {
+        let index_path = Path::new(&self.data_dir).join("issues.index");
+        let mut indices: Vec<_> = self.index.iter().collect();
+        indices.sort_unstable();
+        fs::write(index_path, indices.iter().map(|&id| id.to_string()).collect::<Vec<_>>().join("\n"))?;
+        Ok(())
+    }
+
+    fn finalize(mut self) -> Result<(), Box<dyn Error>> {
+        self.issue_file.write_all(b"\n]")?;
+        self.issue_file.flush()?;
+        Ok(())
+    }
+}
+
+fn export_issues_to_json(data_dir: &str, issues: &[Value]) -> Result<(), Box<dyn Error>> {
+    let mut store = IssueStore::new(data_dir)?;
+    store.add_issues(issues)?;
     Ok(())
 }
 
