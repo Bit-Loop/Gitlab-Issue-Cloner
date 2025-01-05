@@ -525,7 +525,12 @@ fn process_wordlist(data_dir: &str, issues: &[Value]) -> Result<usize, Box<dyn E
 
     let word_count = words.len();
     let wordlist_path = Path::new(data_dir).join("wordlist.txt");
-    fs::write(&wordlist_path, words.into_iter().collect::<Vec<_>>().join("\n"))?;
+    
+    // Convert to sorted vec and join with commas
+    let mut word_vec: Vec<_> = words.into_iter().collect();
+    word_vec.sort();
+    fs::write(&wordlist_path, word_vec.join(","))?;
+    
     println!("Wordlist updated: {} unique words", word_count);
     Ok(word_count)
 }
